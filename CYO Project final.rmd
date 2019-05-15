@@ -1,0 +1,250 @@
+---
+title: "CYO Project"
+author: "Daniel Cash"
+date: "May 13, 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Amazon Kindle rating prediction: Introduction
+For my capstone project I will be constructing a predictive model for Amazon Kindle user ratings. Since the goal will be classification by doing sentiment analysis, the only data that will be used to predict ratings will be the review text itself. The original data can be found on http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Kindle_Store_5.json.gz and the json file contains millions of records. Only a small subset will be used for this project due to hardware restrictions. This way the code will run in a timely manner. The R code will be included in the report to make it easier to follow along. The metrics that will be used in evaluating the models are accuracy and F1. F1 is a balanced, weighted average of precision and recall, with no preference towards either. F1 is a good metric for this problem since no outcome is better or worse than another.
+\newpage
+
+#Methods and Analysis
+First we will load the required packages and data into R. The data has a lot of unnecessary data for our analysis and will need to be tidied. Only 1000 records will be used from the dataset. The ratings will split into two groups for this classification problem. Anything less than a three star rating will be labeled a negative rating and anything else a positive.
+```{r initial, results='hide', warning=FALSE, message=FALSE, echo=FALSE}
+library(jsonlite)
+library(tidyverse)
+library(caret)
+library(tm)
+library(e1071)
+library(wordcloud)
+library(tidytext)
+library(reshape2)
+library(RWeka)
+
+json <- stream_in(file("C:\\Users\\dan-cash\\Documents\\edx\\capstone CYO\\Kindle_Store_5.json"))
+json_tbl <- tbl_df(json)
+set.seed(1)
+reviews <- json_tbl[sample(nrow(json_tbl), 1000), ]
+```
+```{r div, results='hide', warning=FALSE, message=FALSE, echo=FALSE}
+divideSet <- function(data) {
+  result <- ""
+  if(data < 3)
+    result <- "negative"
+  else 
+    result <- "positive"
+  return(result)
+}
+```
+Before the data is split, some exploratory analysis is conducted. A wordcloud will reveal frequency and sentiment at the same time. The wordcloud below uses the bing sentiment lexicon which assigns words into positive and negative categories.
+
+
+
+```{r wordcloud, warning=FALSE, message=FALSE, echo=FALSE}
+tidy_samplet <- reviews %>% 
+  unnest_tokens(word, reviewText)
+tidy_samplet %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 100)
+```
+This doesn't reveal how balanced the dataset is, however. Using the classification rubric, a two dimensional matrix will be constructed using just the text and the rating sentiment. After, a comparison of the count of each label will reveal the disparity between them. This means it will be a difficult task to increase the F1 statistic.
+```{r freq, warning=FALSE, message=FALSE, echo=FALSE}
+text <- unlist(reviews$reviewText)
+sc <- unlist(reviews$overall)
+sc <- map(sc, divideSet)
+sc <- unlist(sc)
+reviews <- cbind(text,sc)
+
+table(reviews[,"sc"])
+```
+The bag of words approach will be used. Each word is represented as a feature and each document a vector of features. Word order is disregarded. Prior to building the model, the vectors are converted into a corpus, a large and structured set of texts. The corpus will be cleaned for punctuation, numbers, whitespaces, stop words, and will be converted to lowercase for easier comparison. The corpus is then converted into a Document Term Matrix. Each row (document) is a review's text. The words are laid out in matrix with words and the occurrence of the words in the documents. The data is then split into training and testing sets.
+```{r split}
+corpus <- VCorpus(VectorSource(text))
+corpus.clean <- corpus %>%
+  tm_map(content_transformer(tolower)) %>% 
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords(kind="en")) %>%
+  tm_map(stripWhitespace)
+
+dtm <- DocumentTermMatrix(corpus.clean)
+
+split_val <- floor(0.8 * nrow(reviews))
+train_ind <- sample(seq_len(nrow(reviews)), size = split_val)
+
+df.train <- reviews[train_ind, ]
+df.test <- reviews[-train_ind, ]
+
+dtm.train <- dtm[train_ind, ]
+dtm.test <- dtm[-train_ind, ]
+
+corpus.clean.train <- corpus.clean[train_ind]
+corpus.clean.test <- corpus.clean[-train_ind]
+```
+Three models for comparison are shown below. The first restricts the document term matrix to only terms that appear at least five times. The second uses a normalized term frequency, Tf-Idf, which measures the relative importance of a word to a document. The third uses bigrams and removes sparse bigrams.
+```{r features}
+fivefreq <- findFreqTerms(dtm.train, 5)
+
+dtm.train.nb <- DocumentTermMatrix(corpus.clean.train, control=list(dictionary = fivefreq))
+dtm.test.nb <- DocumentTermMatrix(corpus.clean.test, control=list(dictionary = fivefreq))
+
+tfidf.dtm.train.nb <- DocumentTermMatrix(corpus.clean.train, control=list(weighting = weightTfIdf))
+tfidf.dtm.test.nb <- DocumentTermMatrix(corpus.clean.test, control=list(weighting = weightTfIdf))
+
+BigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+bi.dtm.train.nb <- DocumentTermMatrix(corpus.clean.train, control = list(tokenize = BigramTokenizer))
+bi.dtm.train.nb <- removeSparseTerms(bi.dtm.train.nb,0.99)
+bi.dtm.test.nb <- DocumentTermMatrix(corpus.clean.test, control = list(tokenize = BigramTokenizer))
+bi.dtm.test.nb <- removeSparseTerms(bi.dtm.test.nb,0.99)
+```
+A binary conversion function is used to label word frequencies as present or absent and is then applied to the document term matrices. The reasoning behind this is that for sentiment classification word occurrence matters more than frequency.
+```{r binary}
+convert_count <- function(x) {
+  y <- ifelse(x > 0, 1,0)
+  y <- factor(y, levels=c(0,1), labels=c("No", "Yes"))
+  y
+}
+
+trainNB <- apply(dtm.train.nb, 2, convert_count)
+testNB <- apply(dtm.test.nb, 2, convert_count)
+tfidf.trainNB <- apply(tfidf.dtm.train.nb, 2, convert_count)
+tfidf.testNB <- apply(tfidf.dtm.test.nb, 2, convert_count)
+bi.trainNB <- apply(bi.dtm.train.nb, 2, convert_count)
+bi.testNB <- apply(bi.dtm.test.nb, 2, convert_count)
+```
+The data is now ready for training and prediction. Naive Bayes evaluates the products of probabilities, which creates problems for the model due to words that do not occur in the sample (0 probability). Therefore, Laplace smoothing is used to assign a small, non-zero probability.
+```{r training}
+classifier <- naiveBayes(trainNB, as.factor(df.train[,"sc"]), laplace = 1)
+tfidf.classifier <- naiveBayes(tfidf.trainNB, as.factor(df.train[,"sc"]), laplace = 1)
+bi.classifier <- naiveBayes(bi.trainNB, as.factor(df.train[,"sc"]), laplace = 1)
+
+pred <- predict(classifier, newdata=testNB)
+tfidf.pred <- predict(tfidf.classifier, newdata=tfidf.testNB)
+bi.pred <- predict(bi.classifier, newdata=bi.testNB)
+```
+Truth tables will show what was and wasn't correctly classified. Then the confusion matrices will be constructed.
+```{r table, warning=FALSE, message=FALSE, echo=FALSE}
+print("Five")
+table("Predictions"= pred,  "Actual" = as.factor(df.test[,"sc"]) )
+print("Tf-Idf")
+table("Predictions"= tfidf.pred,  "Actual" = as.factor(df.test[,"sc"]) )
+print("Bigrams")
+table("Predictions"= bi.pred,  "Actual" = as.factor(df.test[,"sc"]) )
+
+conf.mat <- confusionMatrix(pred, as.factor(df.test[,"sc"]))
+tfidf.conf.mat <- confusionMatrix(tfidf.pred, as.factor(df.test[,"sc"]))
+bi.conf.mat <- confusionMatrix(bi.pred, as.factor(df.test[,"sc"]))
+```
+\newpage
+The results of the confusion matrix will help determine which model tested better.
+```{r test, warning=FALSE, message=FALSE, echo=FALSE}
+print("Five")
+conf.mat$byClass
+conf.mat$overall
+print("Tf-Idf")
+tfidf.conf.mat$byClass
+tfidf.conf.mat$overall
+print("Bigrams")
+bi.conf.mat$byClass
+bi.conf.mat$overall
+```
+The range of the accuracy is not too large, but the F1 score is either N/A or very low. In order to boost this k-fold cross validation will be used. The steps used before will be repeated 10 times in a loop to find the optimal number of folds and the best model.
+```{r cv, results='hide', warning=FALSE, message=FALSE, echo=FALSE}
+folded <- cut(seq(1,nrow(reviews)),breaks=10,labels=FALSE)
+class <- vector(mode = "list", length = 11)
+overall <- vector(mode = "list", length = 7)
+class.tfidf <- vector(mode = "list", length = 11)
+overall.tfidf <- vector(mode = "list", length = 7)
+class.bi <- vector(mode = "list", length = 11)
+overall.bi <- vector(mode = "list", length = 7)
+
+for(i in 1:10){
+  testIndexes <- which(folded==i,arr.ind=TRUE)
+  
+  df.train <- reviews[-testIndexes, ]
+  df.test <- reviews[testIndexes, ]
+  
+  dtm.train <- dtm[-testIndexes, ]
+  dtm.test <- dtm[testIndexes, ]
+  
+  corpus.clean.train <- corpus.clean[-testIndexes]
+  corpus.clean.test <- corpus.clean[testIndexes]
+  
+  fivefreq <- findFreqTerms(dtm.train, 5)
+  
+  dtm.train.nb <- DocumentTermMatrix(corpus.clean.train, control=list(dictionary = fivefreq))
+  dtm.test.nb <- DocumentTermMatrix(corpus.clean.test, control=list(dictionary = fivefreq))
+  tfidf.dtm.train.nb <- DocumentTermMatrix(corpus.clean.train, control=list(weighting = weightTfIdf))
+  tfidf.dtm.test.nb <- DocumentTermMatrix(corpus.clean.test, control=list(weighting = weightTfIdf))
+bi.dtm.train.nb <- DocumentTermMatrix(corpus.clean.train, control = list(tokenize =  BigramTokenizer))
+bi.dtm.train.nb <- removeSparseTerms(bi.dtm.train.nb,0.99)
+bi.dtm.test.nb <- DocumentTermMatrix(corpus.clean.test, control = list(tokenize =  BigramTokenizer))
+bi.dtm.test.nb <- removeSparseTerms(bi.dtm.test.nb,0.99)
+
+  trainNB <- apply(dtm.train.nb, 2, convert_count)
+  testNB <- apply(dtm.test.nb, 2, convert_count)
+  tfidf.trainNB <- apply(tfidf.dtm.train.nb, 2, convert_count)
+  tfidf.testNB <- apply(tfidf.dtm.test.nb, 2, convert_count)
+  bi.trainNB <- apply(bi.dtm.train.nb, 2, convert_count)
+  bi.testNB <- apply(bi.dtm.test.nb, 2, convert_count)
+
+  classifier <- naiveBayes(trainNB, as.factor(df.train[,"sc"]), laplace = 1)
+  tfidf.classifier <- naiveBayes(tfidf.trainNB, as.factor(df.train[,"sc"]), laplace = 1)
+  bi.classifier <- naiveBayes(bi.trainNB, as.factor(df.train[,"sc"]), laplace = 1)
+
+  pred <- predict(classifier, newdata=testNB)
+  tfidf.pred <- predict(tfidf.classifier, newdata=tfidf.testNB)
+  bi.pred <- predict(bi.classifier, newdata=bi.testNB)
+
+  conf.mat <- confusionMatrix(pred, as.factor(df.test[,"sc"]))
+  tfidf.conf.mat <- confusionMatrix(tfidf.pred, as.factor(df.test[,"sc"]))
+  bi.conf.mat <- confusionMatrix(bi.pred, as.factor(df.test[,"sc"]))
+
+  class[[i]] <- conf.mat$byClass
+  overall[[i]] <- conf.mat$overall
+  class.tfidf[[i]] <- tfidf.conf.mat$byClass
+  overall.tfidf[[i]] <- tfidf.conf.mat$overall
+  class.bi[[i]] <- bi.conf.mat$byClass
+  overall.bi[[i]] <- bi.conf.mat$overall
+}
+```
+\newpage
+#Results
+```{r respective, warning=FALSE, echo=FALSE}
+df <- data.frame(do.call(rbind, class))[1:11]
+dfo <- data.frame(do.call(rbind, overall))[1:7]
+df.tfidf <- data.frame(do.call(rbind, class.tfidf))[1:11]
+dfo.tfidf <- data.frame(do.call(rbind, overall.tfidf))[1:7]
+df.bi <- data.frame(do.call(rbind, class.bi))[1:11]
+dfo.bi <- data.frame(do.call(rbind, overall.bi))[1:7]
+#Number of folds with highest F1 score
+n_folds <- order(df['F1'],decreasing=T)[1]
+message("Five - # of folds:",n_folds)
+n_folds.tfidf <- order(df.tfidf['F1'],decreasing=T)[1]
+message("Tf-Idf - # of folds:",n_folds.tfidf)
+n_folds.bi <- order(df.bi['F1'],decreasing=T)[1]
+message("Bigrams - # of folds:",n_folds.bi)
+#F1 score
+message("Five - F1:",df[n_folds, 'F1'])
+message("Tf-Idf - F1:",df.tfidf[n_folds.tfidf, 'F1'])
+message("Bigrams - F1:",df.bi[n_folds.bi, 'F1'])
+#Accuracy
+message("Five - Accuracy:",dfo[n_folds,"Accuracy"])
+message("Tf-Idf - Accuracy:",dfo.tfidf[n_folds.tfidf,"Accuracy"])
+message("Bigrams - Accuracy:",dfo.bi[n_folds.bi,"Accuracy"])
+#Guess Accuracy
+# 57      943 
+message("Always guess positive:", (943)/(943+57))
+```
+The at least five frequency model improved quite a bit and now beats the Tf-idf model in both F1 and accuracy. Blindly guessing a positive sentiment (3 or higher) will lead to a high accuracy, higher than all but the bigrams model. This shows how imbalanced the dataset is and why the F1 score is important. The Bi-gram model preformed the best in terms of accuracy and F1 score and therefore is the best model.
+
+#Conclusion
+The initial models that did not use cross validation had little ability to predict true negatives even though the accuracy was high. With cross validation both the accuracy and F1 scores improved. Despite the simplicity of assumptions, the Naive Bayes algorithm does reasonably well. Only a small subset of the data was used due to hardware restrictions. Future analysis could use more data and would produce better models.
